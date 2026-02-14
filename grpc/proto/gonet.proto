@@ -1,0 +1,51 @@
+syntax = "proto3";
+
+package gonet;
+
+option go_package = "gonet/grpc/pb";
+
+// Item used across all 4 RPC types
+message Item {
+  string id = 1;
+  string name = 2;
+  string data = 3;
+  int64 timestamp = 4;
+}
+
+message GetItemRequest {
+  string id = 1;
+}
+
+message GetItemResponse {
+  Item item = 1;
+}
+
+message ListItemsRequest {
+  string prefix = 1;
+  int32 count = 2;
+}
+
+message SendItemsResponse {
+  int32 received_count = 1;
+  string summary = 2;
+}
+
+message ExchangeMessage {
+  string sender = 1;
+  string content = 2;
+  int64 sequence = 3;
+}
+
+service GonetService {
+  // 1. Unary — single request, single response
+  rpc GetItem(GetItemRequest) returns (GetItemResponse);
+
+  // 2. Server Streaming — single request, stream of responses
+  rpc ListItems(ListItemsRequest) returns (stream Item);
+
+  // 3. Client Streaming — stream of requests, single response
+  rpc SendItems(stream Item) returns (SendItemsResponse);
+
+  // 4. Bidirectional Streaming — stream both directions simultaneously
+  rpc Exchange(stream ExchangeMessage) returns (stream ExchangeMessage);
+}
