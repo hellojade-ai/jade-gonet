@@ -1,10 +1,13 @@
 package main
 
 import (
+	"bufio"
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"log"
 	"net/http"
+	"strings"
 	"sync"
 	"time"
 
@@ -289,6 +292,160 @@ func handleChat(w http.ResponseWriter, r *http.Request) {
 }
 
 // =============================================================================
+// 6. Jade Chat — AI chat relay: validates token, streams from Jade API
+// =============================================================================
+
+type JadeChatRequest struct {
+	Action   string            `json:"action"`
+	Token    string            `json:"token"`
+	Messages []JadeChatMessage `json:"messages"`
+}
+
+type JadeChatMessage struct {
+	Role    string `json:"role"`
+	Content string `json:"content"`
+}
+
+type JadeChatResponse struct {
+	Event string          `json:"event"`
+	Data  json.RawMessage `json:"data"`
+}
+
+const (
+	nestjsBaseURL  = "http://localhost:3000/api"
+	jadeAPIBaseURL = "http://localhost:8002"
+)
+
+func sendJadeEvent(conn *websocket.Conn, event string, data interface{}) {
+	payload, _ := json.Marshal(data)
+	msg := JadeChatResponse{Event: event, Data: payload}
+	raw, _ := json.Marshal(msg)
+	conn.WriteMessage(websocket.TextMessage, raw)
+}
+
+func sendJadeError(conn *websocket.Conn, message string) {
+	sendJadeEvent(conn, "error", map[string]string{"message": message})
+}
+
+func handleJadeChat(w http.ResponseWriter, r *http.Request) {
+	conn, err := upgrader.Upgrade(w, r, nil)
+	if err != nil {
+		log.Printf("jade-chat upgrade error: %v", err)
+		return
+	}
+	defer conn.Close()
+
+	for {
+		_, raw, err := conn.ReadMessage()
+		if err != nil {
+			break
+		}
+
+		var req JadeChatRequest
+		if err := json.Unmarshal(raw, &req); err != nil {
+			sendJadeError(conn, "invalid JSON")
+			continue
+		}
+
+		if req.Action != "chat" {
+			sendJadeError(conn, "unknown action, expected 'chat'")
+			continue
+		}
+
+		if req.Token == "" {
+			sendJadeError(conn, "token is required")
+			continue
+		}
+
+		// Validate stream token with NestJS
+		validResp, err := http.Get(fmt.Sprintf("%s/conversations/validate-token/%s", nestjsBaseURL, req.Token))
+		if err != nil {
+			sendJadeError(conn, "token validation failed: service unreachable")
+			continue
+		}
+		validResp.Body.Close()
+
+		if validResp.StatusCode != 200 {
+			sendJadeError(conn, "invalid or expired token")
+			continue
+		}
+
+		// Extract last user message for Jade API
+		var lastUserMessage string
+		for i := len(req.Messages) - 1; i >= 0; i-- {
+			if req.Messages[i].Role == "user" {
+				lastUserMessage = req.Messages[i].Content
+				break
+			}
+		}
+		if lastUserMessage == "" {
+			sendJadeError(conn, "no user message found")
+			continue
+		}
+
+		// Call Jade API /chat/stream
+		jadeBody, _ := json.Marshal(map[string]interface{}{
+			"message":    lastUserMessage,
+			"max_tokens": 1024,
+		})
+
+		jadeResp, err := http.Post(
+			fmt.Sprintf("%s/chat/stream", jadeAPIBaseURL),
+			"application/json",
+			bytes.NewReader(jadeBody),
+		)
+		if err != nil {
+			sendJadeError(conn, "AI service unreachable")
+			continue
+		}
+
+		// Stream SSE response back as WebSocket frames
+		fullContent := streamJadeResponse(conn, jadeResp)
+		jadeResp.Body.Close()
+
+		if fullContent != "" {
+			sendJadeEvent(conn, "done", map[string]interface{}{
+				"content":    fullContent,
+				"tokenCount": len(strings.Fields(fullContent)),
+			})
+		}
+	}
+}
+
+// streamJadeResponse reads SSE events from Jade API and relays tokens via WebSocket.
+func streamJadeResponse(conn *websocket.Conn, resp *http.Response) string {
+	scanner := bufio.NewScanner(resp.Body)
+	var fullContent strings.Builder
+
+	for scanner.Scan() {
+		line := scanner.Text()
+
+		if !strings.HasPrefix(line, "data: ") {
+			continue
+		}
+
+		data := line[6:]
+
+		var parsed map[string]interface{}
+		if err := json.Unmarshal([]byte(data), &parsed); err != nil {
+			continue
+		}
+
+		if token, ok := parsed["token"].(string); ok {
+			fullContent.WriteString(token)
+			sendJadeEvent(conn, "token", token)
+		}
+
+		if errMsg, ok := parsed["error"].(string); ok {
+			sendJadeError(conn, errMsg)
+			return ""
+		}
+	}
+
+	return fullContent.String()
+}
+
+// =============================================================================
 // Main
 // =============================================================================
 
@@ -298,10 +455,11 @@ func main() {
 	http.HandleFunc("/ws/pubsub", handlePubSub)
 	http.HandleFunc("/ws/stream", handleStream)
 	http.HandleFunc("/ws/chat", handleChat)
+	http.HandleFunc("/ws/jade-chat", handleJadeChat)
 
 	http.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
-		w.Write([]byte(`{"status":"ok","service":"wss","endpoints":["/ws/echo","/ws/broadcast","/ws/pubsub","/ws/stream","/ws/chat"]}`))
+		w.Write([]byte(`{"status":"ok","service":"wss","endpoints":["/ws/echo","/ws/broadcast","/ws/pubsub","/ws/stream","/ws/chat","/ws/jade-chat"]}`))
 	})
 
 	log.Println("WSS server starting on :8000")
