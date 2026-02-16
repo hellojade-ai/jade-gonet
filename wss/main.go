@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"log"
 	"net/http"
+	"os"
 	"strings"
 	"sync"
 	"time"
@@ -311,10 +312,38 @@ type JadeChatResponse struct {
 	Data  json.RawMessage `json:"data"`
 }
 
-const (
-	nestjsBaseURL  = "http://localhost:3000/api"
-	jadeAPIBaseURL = "http://localhost:8002"
+func getEnv(key, fallback string) string {
+	if v := os.Getenv(key); v != "" {
+		return v
+	}
+	return fallback
+}
+
+var (
+	nestjsBaseURL = getEnv("NESTJS_BASE_URL", "http://localhost:3000/api")
+	vllmBaseURL   = getEnv("VLLM_BASE_URL", "https://vllm.hellojade.ai")
+	vllmModel     = getEnv("VLLM_MODEL", "gemma-3-27b-it")
 )
+
+// OpenAI streaming response types
+type OpenAIChatRequest struct {
+	Model     string            `json:"model"`
+	Messages  []JadeChatMessage `json:"messages"`
+	Stream    bool              `json:"stream"`
+	MaxTokens int               `json:"max_tokens"`
+}
+
+type OpenAIStreamChunk struct {
+	Choices []struct {
+		Delta struct {
+			Content string `json:"content"`
+		} `json:"delta"`
+		FinishReason *string `json:"finish_reason"`
+	} `json:"choices"`
+	Usage *struct {
+		CompletionTokens int `json:"completion_tokens"`
+	} `json:"usage"`
+}
 
 func sendJadeEvent(conn *websocket.Conn, event string, data interface{}) {
 	payload, _ := json.Marshal(data)
@@ -370,52 +399,43 @@ func handleJadeChat(w http.ResponseWriter, r *http.Request) {
 			continue
 		}
 
-		// Extract last user message for Jade API
-		var lastUserMessage string
-		for i := len(req.Messages) - 1; i >= 0; i-- {
-			if req.Messages[i].Role == "user" {
-				lastUserMessage = req.Messages[i].Content
-				break
-			}
+		// Build OpenAI chat completion request with full message history
+		openaiReq := OpenAIChatRequest{
+			Model:     vllmModel,
+			Messages:  req.Messages,
+			Stream:    true,
+			MaxTokens: 1024,
 		}
-		if lastUserMessage == "" {
-			sendJadeError(conn, "no user message found")
-			continue
-		}
+		reqBody, _ := json.Marshal(openaiReq)
 
-		// Call Jade API /chat/stream
-		jadeBody, _ := json.Marshal(map[string]interface{}{
-			"message":    lastUserMessage,
-			"max_tokens": 1024,
-		})
-
-		jadeResp, err := http.Post(
-			fmt.Sprintf("%s/chat/stream", jadeAPIBaseURL),
+		vllmResp, err := http.Post(
+			fmt.Sprintf("%s/v1/chat/completions", vllmBaseURL),
 			"application/json",
-			bytes.NewReader(jadeBody),
+			bytes.NewReader(reqBody),
 		)
 		if err != nil {
 			sendJadeError(conn, "AI service unreachable")
 			continue
 		}
 
-		// Stream SSE response back as WebSocket frames
-		fullContent := streamJadeResponse(conn, jadeResp)
-		jadeResp.Body.Close()
+		// Stream OpenAI SSE response back as WebSocket frames
+		fullContent, tokenCount := streamOpenAIResponse(conn, vllmResp)
+		vllmResp.Body.Close()
 
 		if fullContent != "" {
 			sendJadeEvent(conn, "done", map[string]interface{}{
 				"content":    fullContent,
-				"tokenCount": len(strings.Fields(fullContent)),
+				"tokenCount": tokenCount,
 			})
 		}
 	}
 }
 
-// streamJadeResponse reads SSE events from Jade API and relays tokens via WebSocket.
-func streamJadeResponse(conn *websocket.Conn, resp *http.Response) string {
+// streamOpenAIResponse reads OpenAI SSE events and relays tokens via WebSocket.
+func streamOpenAIResponse(conn *websocket.Conn, resp *http.Response) (string, int) {
 	scanner := bufio.NewScanner(resp.Body)
 	var fullContent strings.Builder
+	tokenCount := 0
 
 	for scanner.Scan() {
 		line := scanner.Text()
@@ -426,23 +446,39 @@ func streamJadeResponse(conn *websocket.Conn, resp *http.Response) string {
 
 		data := line[6:]
 
-		var parsed map[string]interface{}
-		if err := json.Unmarshal([]byte(data), &parsed); err != nil {
+		// OpenAI signals end of stream with [DONE]
+		if data == "[DONE]" {
+			break
+		}
+
+		var chunk OpenAIStreamChunk
+		if err := json.Unmarshal([]byte(data), &chunk); err != nil {
 			continue
 		}
 
-		if token, ok := parsed["token"].(string); ok {
-			fullContent.WriteString(token)
-			sendJadeEvent(conn, "token", token)
+		if len(chunk.Choices) > 0 {
+			content := chunk.Choices[0].Delta.Content
+			if content != "" {
+				fullContent.WriteString(content)
+				sendJadeEvent(conn, "token", content)
+			}
+
+			if chunk.Choices[0].FinishReason != nil {
+				break
+			}
 		}
 
-		if errMsg, ok := parsed["error"].(string); ok {
-			sendJadeError(conn, errMsg)
-			return ""
+		if chunk.Usage != nil {
+			tokenCount = chunk.Usage.CompletionTokens
 		}
 	}
 
-	return fullContent.String()
+	// Fallback token count if not provided by API
+	if tokenCount == 0 {
+		tokenCount = len(strings.Fields(fullContent.String()))
+	}
+
+	return fullContent.String(), tokenCount
 }
 
 // =============================================================================
